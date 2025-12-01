@@ -3,6 +3,22 @@
   "version": "1.0.0",
   "description": "Interactive CLI to batch-merge Renovate PRs",
   "license": "MIT",
+  "author": "Christian Schuhbaum",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kr1x/gh-renovate"
+  },
+  "keywords": [
+    "renovate",
+    "github",
+    "cli",
+    "merge",
+    "pull-request",
+    "automation"
+  ],
+  "files": [
+    "dist"
+  ],
   "type": "module",
   "main": "dist/index.js",
   "bin": {
