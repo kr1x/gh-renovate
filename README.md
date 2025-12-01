@@ -31,26 +31,19 @@ This is repetitive and tedious.
    - Waits for CI
    - Merges
 
-## Installation
-
-```bash
-npm install
-npm run build
-```
-
 ## Usage
 
 ```bash
 # With repo URL
-npm run start owner/repo
-npm run start https://github.com/owner/repo
+npx gh-renovate owner/repo
+npx gh-renovate https://github.com/owner/repo
 
 # Interactive (prompts for URL)
-npm run start
+npx gh-renovate
 
 # Dry-run (no changes, shows what would happen)
-npm run start -- --dry-run owner/repo
-npm run start -- -n owner/repo
+npx gh-renovate --dry-run owner/repo
+npx gh-renovate -n owner/repo
 ```
 
 ### Requirements
