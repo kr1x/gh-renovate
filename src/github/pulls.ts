@@ -4,7 +4,7 @@
 
 import type { GitHubClient } from './client.js';
 import type { PullRequest, MergeMethod, MergeResult } from './types.js';
-import { PRStateError, ErrorCode } from '../errors/types.js';
+import { PRStateError, MergeBlockedError, ErrorCode } from '../errors/types.js';
 
 /**
  * Map GitHub API response to our PullRequest type
@@ -196,10 +196,10 @@ export async function mergePullRequest(
     if (error && typeof error === 'object' && 'status' in error) {
       const status = (error as { status: number }).status;
       if (status === 405) {
-        throw new PRStateError(
-          ErrorCode.PR_NOT_MERGEABLE,
+        // 405 can mean checks are still pending - throw recoverable error
+        throw new MergeBlockedError(
           prNumber,
-          'PR cannot be merged (method not allowed or requirements not met)'
+          'Merge blocked (likely pending checks or branch protection requirements)'
         );
       }
       if (status === 409) {

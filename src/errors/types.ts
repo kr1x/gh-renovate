@@ -19,6 +19,7 @@ export enum ErrorCode {
   PR_HAS_CONFLICTS = 'PR_HAS_CONFLICTS',
   PR_NOT_MERGEABLE = 'PR_NOT_MERGEABLE',
   PR_CHECKS_FAILED = 'PR_CHECKS_FAILED',
+  MERGE_BLOCKED_PENDING_CHECKS = 'MERGE_BLOCKED_PENDING_CHECKS',
 
   // Network
   NETWORK_TIMEOUT = 'NETWORK_TIMEOUT',
@@ -88,6 +89,19 @@ export class PRStateError extends GhRenovateError {
       | ErrorCode.PR_HAS_CONFLICTS
       | ErrorCode.PR_NOT_MERGEABLE
       | ErrorCode.PR_CHECKS_FAILED,
+    readonly prNumber: number,
+    readonly userMessage: string,
+    cause?: Error
+  ) {
+    super(`PR #${prNumber}: ${userMessage}`, cause);
+  }
+}
+
+export class MergeBlockedError extends GhRenovateError {
+  readonly code = ErrorCode.MERGE_BLOCKED_PENDING_CHECKS;
+  readonly recoverable = true;
+
+  constructor(
     readonly prNumber: number,
     readonly userMessage: string,
     cause?: Error

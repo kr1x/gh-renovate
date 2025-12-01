@@ -6,6 +6,7 @@ import type { GitHubClient } from '../github/client.js';
 import type { PullRequest, ChecksStatus, MergeMethod } from '../github/types.js';
 import { getPullRequest, mergePullRequest, validatePRState, needsRebase } from '../github/pulls.js';
 import { getChecksStatus, areChecksPassing, areChecksPending, areChecksFailing, formatFailedChecks } from '../github/checks.js';
+import { MergeBlockedError } from '../errors/types.js';
 import { getReviewInfo, approvePullRequest } from '../github/reviews.js';
 import { triggerRebase, hasNewCommitSince } from '../renovate/rebase.js';
 import { poll, sleep, formatDuration, createCICheckPollerOptions, createRebasePollerOptions } from '../utils/poller.js';
@@ -246,14 +247,71 @@ async function processSinglePR(
       }
     }
 
-    // Step 7: Merge!
+    // Step 7: Merge with retry logic for late-starting checks
     if (options.dryRun) {
       ui.updateStatus('[DRY-RUN] Would merge PR...');
     } else {
-      ui.updateStatus('Merging...');
-      await mergePullRequest(client, owner, repo, pr.number, {
-        mergeMethod: options.mergeMethod,
-      });
+      const maxMergeRetries = 3;
+      let mergeAttempt = 0;
+
+      while (mergeAttempt < maxMergeRetries) {
+        mergeAttempt++;
+        ui.updateStatus(mergeAttempt > 1 ? `Merging (attempt ${mergeAttempt})...` : 'Merging...');
+
+        try {
+          await mergePullRequest(client, owner, repo, pr.number, {
+            mergeMethod: options.mergeMethod,
+          });
+          break; // Success!
+        } catch (mergeError) {
+          if (mergeError instanceof MergeBlockedError && mergeAttempt < maxMergeRetries) {
+            // Merge failed - might be due to late-starting checks
+            ui.updateStatus('Merge blocked, checking for pending checks...');
+
+            // Re-fetch PR data and check status
+            freshPR = await getPullRequest(client, owner, repo, pr.number);
+            checksStatus = await getChecksStatus(client, owner, repo, freshPR.head.sha);
+
+            if (areChecksPending(checksStatus)) {
+              // There are pending checks - wait for them
+              ui.updateStatus('New checks detected, waiting...');
+
+              checksStatus = await poll<ChecksStatus>(
+                () => getChecksStatus(client, owner, repo, freshPR.head.sha),
+                {
+                  ...createCICheckPollerOptions(
+                    (status) => {
+                      if (areChecksFailing(status)) return 'done';
+                      if (areChecksPassing(status)) return 'done';
+                      return 'continue';
+                    },
+                    (status, elapsed) => {
+                      ui.updateStatus(
+                        `Waiting for late checks: ${status.successful}/${status.total} passed (${formatDuration(elapsed)})`
+                      );
+                    }
+                  ),
+                  timeoutMs: options.checkTimeoutMs,
+                }
+              );
+
+              if (areChecksFailing(checksStatus)) {
+                result.status = 'skipped';
+                result.reason = `CI checks failed: ${formatFailedChecks(checksStatus)}`;
+                return result;
+              }
+
+              // Checks passed, loop will retry merge
+              continue;
+            }
+
+            // No pending checks but merge still blocked - give up
+            throw mergeError;
+          }
+          // Non-recoverable error or max retries reached
+          throw mergeError;
+        }
+      }
     }
 
     result.status = 'merged';
