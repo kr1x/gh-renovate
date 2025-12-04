@@ -10,8 +10,8 @@ export interface RepoInfo {
 }
 
 const GITHUB_URL_PATTERNS = [
-  // HTTPS: https://github.com/owner/repo or https://github.com/owner/repo.git
-  /^https?:\/\/github\.com\/([^/]+)\/([^/]+?)(\.git)?\/?$/,
+  // HTTPS with optional subpaths: https://github.com/owner/repo, https://github.com/owner/repo/pulls, https://github.com/owner/repo/pull/123
+  /^https?:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git|\/.*)?$/,
   // SSH: git@github.com:owner/repo.git
   /^git@github\.com:([^/]+)\/([^/]+?)(\.git)?$/,
   // Simple: owner/repo
