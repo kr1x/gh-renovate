@@ -77,6 +77,16 @@ export class UIController {
   }
 
   /**
+   * Mark PR as deferred for retry later
+   */
+  deferPR(pr: PullRequest, reason: string): void {
+    this.spinner.info(
+      chalk.cyan(`#${pr.number}: Deferred - ${reason} (will retry)`)
+    );
+    this.currentPR = undefined;
+  }
+
+  /**
    * Show an info message
    */
   info(message: string): void {

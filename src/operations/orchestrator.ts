@@ -363,6 +363,22 @@ async function processSinglePR(
 }
 
 /**
+ * Reasons that allow a PR to be retried later
+ */
+function isRetriableReason(reason: string | undefined): boolean {
+  if (!reason) return false;
+  const lowerReason = reason.toLowerCase();
+  // Retriable: CI failures (might pass after rebase), merge blocked, needs rebase
+  // Not retriable: stability-days (won't change), already merged, closed
+  return (
+    lowerReason.includes('ci checks failed') ||
+    lowerReason.includes('merge blocked') ||
+    lowerReason.includes('needs rebase') ||
+    lowerReason.includes('timeout')
+  );
+}
+
+/**
  * Orchestrate the merge workflow for multiple PRs
  */
 export async function orchestrateMerge(
@@ -371,53 +387,66 @@ export async function orchestrateMerge(
   repo: string,
   prs: PullRequest[],
   options: Partial<OrchestratorOptions> = {},
-  onAskContinue?: (prNumber: number, reason: string) => Promise<boolean>
+  _onAskContinue?: (prNumber: number, reason: string) => Promise<boolean>
 ): Promise<OrchestratorResult> {
   const opts = { ...DEFAULT_OPTIONS, ...options };
   const ui = new UIController();
   const results: MergeResultSummary[] = [];
 
-  for (let i = 0; i < prs.length; i++) {
-    const pr = prs[i];
-    const position = `[${i + 1}/${prs.length}]`;
+  // Track PRs to retry and which have already been retried
+  const deferredPRs: PullRequest[] = [];
+  const retriedPRNumbers = new Set<number>();
+
+  // Process all PRs
+  const allPRs = [...prs];
+
+  while (allPRs.length > 0) {
+    const pr = allPRs.shift()!;
+    const isRetry = retriedPRNumbers.has(pr.number);
+    const totalCount = prs.length + deferredPRs.filter(p => !retriedPRNumbers.has(p.number)).length;
+    const processedCount = results.filter(r => r.status === 'merged').length + 1;
+    const position = isRetry ? `[retry]` : `[${processedCount}/${prs.length}]`;
 
     ui.startPR(pr, position);
 
     const result = await processSinglePR(client, owner, repo, pr, ui, opts);
-    results.push(result);
 
     // Update UI based on result
     switch (result.status) {
       case 'merged':
         ui.completePR(pr, opts.dryRun);
+        results.push(result);
         break;
       case 'skipped':
-        ui.skipPR(pr, result.reason ?? 'Unknown reason');
-        break;
       case 'failed':
-        ui.failPR(pr, result.reason ?? 'Unknown error');
-        break;
-    }
-
-    // Handle non-merged PRs
-    if (result.status !== 'merged') {
-      if (!opts.continueOnError) {
-        // Stop processing
-        break;
-      }
-
-      // Ask user if they want to continue (if callback provided)
-      if (onAskContinue) {
-        const shouldContinue = await onAskContinue(pr.number, result.reason ?? 'Unknown');
-        if (!shouldContinue) {
-          break;
+        // Check if this PR can be retried later
+        if (!isRetry && isRetriableReason(result.reason)) {
+          ui.deferPR(pr, result.reason ?? 'Unknown reason');
+          deferredPRs.push(pr);
+        } else {
+          if (result.status === 'skipped') {
+            ui.skipPR(pr, result.reason ?? 'Unknown reason');
+          } else {
+            ui.failPR(pr, result.reason ?? 'Unknown error');
+          }
+          results.push(result);
         }
-      }
+        break;
     }
 
     // Small delay between PRs to be nice to the API and let GitHub process
-    if (i < prs.length - 1 && result.status === 'merged') {
+    if (allPRs.length > 0 || deferredPRs.length > 0) {
       await sleep(3000);
+    }
+
+    // If we've processed all original PRs, add deferred ones for retry
+    if (allPRs.length === 0 && deferredPRs.length > 0) {
+      console.log(`\n🔄 Retrying ${deferredPRs.length} deferred PR(s)...\n`);
+      for (const deferred of deferredPRs) {
+        retriedPRNumbers.add(deferred.number);
+        allPRs.push(deferred);
+      }
+      deferredPRs.length = 0; // Clear deferred list
     }
   }
 
