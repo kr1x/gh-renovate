@@ -10,6 +10,7 @@ import { listOpenPullRequests } from './github/pulls.js';
 import { getChecksStatus } from './github/checks.js';
 import { filterRenovatePRs } from './renovate/detector.js';
 import { parseRepoUrl } from './utils/url-parser.js';
+import { addRecentRepo } from './utils/config.js';
 import { orchestrateMerge } from './operations/orchestrator.js';
 import {
   promptForToken,
@@ -89,6 +90,9 @@ async function main(): Promise<void> {
 
     // Step 5: Filter to Renovate PRs
     const renovatePRs = filterRenovatePRs(allPRs);
+
+    // Save repo to history (valid repo, even if no PRs)
+    await addRecentRepo(`${owner}/${repo}`);
 
     if (renovatePRs.length === 0) {
       console.log(chalk.yellow('No open Renovate PRs found.'));

@@ -2,10 +2,11 @@
  * CLI prompts for user interaction
  */
 
-import { checkbox, confirm, input, password } from '@inquirer/prompts';
+import { checkbox, confirm, input, password, select } from '@inquirer/prompts';
 import type { PullRequest } from '../github/types.js';
 import type { ChecksStatus } from '../github/types.js';
 import { formatPRChoice, formatChecksStatus } from './ui.js';
+import { getRecentRepos } from '../utils/config.js';
 
 /**
  * Prompt for GitHub token
@@ -17,10 +18,30 @@ export async function promptForToken(): Promise<string> {
   });
 }
 
+const NEW_REPO_OPTION = '__new__';
+
 /**
- * Prompt for repository URL
+ * Prompt for repository URL, showing recent repos if available
  */
 export async function promptForRepoUrl(): Promise<string> {
+  const recentRepos = await getRecentRepos();
+
+  if (recentRepos.length > 0) {
+    const choices = [
+      ...recentRepos.map((repo) => ({ name: repo, value: repo })),
+      { name: '→ Enter different repository...', value: NEW_REPO_OPTION },
+    ];
+
+    const selected = await select({
+      message: 'Select repository:',
+      choices,
+    });
+
+    if (selected !== NEW_REPO_OPTION) {
+      return selected;
+    }
+  }
+
   return input({
     message: 'Enter GitHub repository URL (e.g., owner/repo):',
     validate: (value) => {
