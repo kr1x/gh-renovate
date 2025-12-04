@@ -5,7 +5,14 @@
 import type { GitHubClient } from '../github/client.js';
 import type { PullRequest, ChecksStatus, MergeMethod } from '../github/types.js';
 import { getPullRequest, mergePullRequest, validatePRState, needsRebase } from '../github/pulls.js';
-import { getChecksStatus, areChecksPassing, areChecksPending, areChecksFailing, formatFailedChecks } from '../github/checks.js';
+import {
+  getChecksStatus,
+  areChecksPassing,
+  areChecksPending,
+  areChecksFailing,
+  formatFailedChecks,
+  hasStabilityDaysPending,
+} from '../github/checks.js';
 import { MergeBlockedError } from '../errors/types.js';
 import { getReviewInfo, approvePullRequest } from '../github/reviews.js';
 import { triggerRebase, hasNewCommitSince } from '../renovate/rebase.js';
@@ -43,8 +50,49 @@ export interface OrchestratorResult {
   dryRun: boolean;
 }
 
+/** Maximum retries for the entire PR processing (fail-safe) */
+const MAX_PROCESS_RETRIES = 3;
+
+/**
+ * Wait for CI checks to complete
+ */
+async function waitForChecks(
+  client: GitHubClient,
+  owner: string,
+  repo: string,
+  sha: string,
+  ui: UIController,
+  timeoutMs: number,
+  statusPrefix: string = 'Waiting for CI'
+): Promise<{ status: ChecksStatus; passed: boolean }> {
+  const checksStatus = await poll<ChecksStatus>(
+    () => getChecksStatus(client, owner, repo, sha),
+    {
+      ...createCICheckPollerOptions(
+        (status) => {
+          if (areChecksFailing(status)) return 'done';
+          if (areChecksPassing(status)) return 'done';
+          return 'continue';
+        },
+        (status, elapsed) => {
+          ui.updateStatus(
+            `${statusPrefix}: ${status.successful}/${status.total} passed (${formatDuration(elapsed)})`
+          );
+        }
+      ),
+      timeoutMs,
+    }
+  );
+
+  return {
+    status: checksStatus,
+    passed: areChecksPassing(checksStatus),
+  };
+}
+
 /**
  * Process a single PR through the merge workflow
+ * Includes fail-safe retry logic - if something goes wrong, starts over
  */
 async function processSinglePR(
   client: GitHubClient,
@@ -60,273 +108,258 @@ async function processSinglePR(
     status: 'failed',
   };
 
-  try {
-    // Step 1: Get fresh PR data
-    ui.updateStatus('Fetching latest PR data...');
-    let freshPR = await getPullRequest(client, owner, repo, pr.number);
+  // Fail-safe retry loop - if anything goes wrong, start over
+  for (let attempt = 1; attempt <= MAX_PROCESS_RETRIES; attempt++) {
+    try {
+      if (attempt > 1) {
+        ui.updateStatus(`Retrying from start (attempt ${attempt}/${MAX_PROCESS_RETRIES})...`);
+        await sleep(2000); // Brief pause before retry
+      }
 
-    // Step 2: Validate PR state
-    const validation = validatePRState(freshPR);
-    if (!validation.valid) {
-      result.status = 'skipped';
-      result.reason = validation.reason;
-      return result;
-    }
+      // Step 1: Get fresh PR data
+      ui.updateStatus('Fetching latest PR data...');
+      let freshPR = await getPullRequest(client, owner, repo, pr.number);
 
-    // Step 3: Check CI status
-    ui.updateStatus('Checking CI status...');
-    let checksStatus = await getChecksStatus(client, owner, repo, freshPR.head.sha);
+      // Step 2: Validate PR state
+      const validation = validatePRState(freshPR);
+      if (!validation.valid) {
+        result.status = 'skipped';
+        result.reason = validation.reason;
+        return result;
+      }
 
-    // If checks are failing, skip
-    if (areChecksFailing(checksStatus)) {
-      result.status = 'skipped';
-      result.reason = `CI checks failed: ${formatFailedChecks(checksStatus)}`;
-      return result;
-    }
+      // Step 3: Check CI status
+      ui.updateStatus('Checking CI status...');
+      let checksStatus = await getChecksStatus(client, owner, repo, freshPR.head.sha);
 
-    // If checks are pending, wait
-    if (areChecksPending(checksStatus)) {
-      ui.updateStatus('Waiting for CI checks...');
-
-      checksStatus = await poll<ChecksStatus>(
-        () => getChecksStatus(client, owner, repo, freshPR.head.sha),
-        {
-          ...createCICheckPollerOptions(
-            (status) => {
-              if (areChecksFailing(status)) return 'done';
-              if (areChecksPassing(status)) return 'done';
-              return 'continue';
-            },
-            (status, elapsed) => {
-              ui.updateStatus(
-                `Waiting for CI: ${status.successful}/${status.total} passed (${formatDuration(elapsed)})`
-              );
-            }
-          ),
-          timeoutMs: options.checkTimeoutMs,
-        }
-      );
-
+      // If checks are failing, skip (not retriable)
       if (areChecksFailing(checksStatus)) {
         result.status = 'skipped';
         result.reason = `CI checks failed: ${formatFailedChecks(checksStatus)}`;
         return result;
       }
-    }
 
-    // Step 4: Check approval status
-    ui.updateStatus('Checking review status...');
-    const reviewInfo = await getReviewInfo(client, owner, repo, pr.number);
-
-    if (!reviewInfo.hasApproval) {
-      if (options.dryRun) {
-        ui.updateStatus('[DRY-RUN] Would approve PR...');
-      } else {
-        ui.updateStatus('Approving PR...');
-        await approvePullRequest(client, owner, repo, pr.number);
+      // Skip PRs with stability-days pending - these need to wait
+      if (hasStabilityDaysPending(checksStatus)) {
+        result.status = 'skipped';
+        result.reason = 'Waiting for stability-days (skipped)';
+        return result;
       }
-    }
 
-    // Step 5: Handle rebase if needed
-    freshPR = await getPullRequest(client, owner, repo, pr.number);
-
-    if (needsRebase(freshPR)) {
-      if (options.dryRun) {
-        ui.updateStatus('[DRY-RUN] Would trigger rebase...');
-        // In dry-run mode, we skip waiting for rebase since we didn't trigger it
-      } else {
-        ui.updateStatus('Triggering rebase...');
-        const previousSha = freshPR.head.sha;
-        const method = await triggerRebase(client, owner, repo, freshPR);
-        ui.updateStatus(`Rebase triggered via ${method}, waiting...`);
-
-        // Wait for Renovate to push a new commit
-        await poll<{ hasNewCommit: boolean; currentSha: string }>(
-          () => hasNewCommitSince(client, owner, repo, pr.number, previousSha),
-          {
-            ...createRebasePollerOptions(
-              (pollResult) => (pollResult.hasNewCommit ? 'done' : 'continue'),
-              (_, elapsed) => {
-                ui.updateStatus(`Waiting for rebase (${formatDuration(elapsed)})`);
-              }
-            ),
-            timeoutMs: options.rebaseTimeoutMs,
-          }
+      // If there are pending checks, wait for them
+      if (areChecksPending(checksStatus)) {
+        ui.updateStatus('Waiting for CI checks...');
+        const checkResult = await waitForChecks(
+          client, owner, repo, freshPR.head.sha, ui, options.checkTimeoutMs
         );
+        checksStatus = checkResult.status;
 
-        // Wait a moment for GitHub to update PR state
-        await sleep(3000);
-
-        // Get new PR data after rebase
-        freshPR = await getPullRequest(client, owner, repo, pr.number);
-
-        // Wait for CI checks on the new commit
-        ui.updateStatus('Waiting for CI after rebase...');
-
-        checksStatus = await poll<ChecksStatus>(
-          () => getChecksStatus(client, owner, repo, freshPR.head.sha),
-          {
-            ...createCICheckPollerOptions(
-              (status) => {
-                if (areChecksFailing(status)) return 'done';
-                if (areChecksPassing(status)) return 'done';
-                return 'continue';
-              },
-              (status, elapsed) => {
-                ui.updateStatus(
-                  `Waiting for CI after rebase: ${status.successful}/${status.total} passed (${formatDuration(elapsed)})`
-                );
-              }
-            ),
-            timeoutMs: options.checkTimeoutMs,
-          }
-        );
-
-        if (areChecksFailing(checksStatus)) {
+        if (!checkResult.passed) {
           result.status = 'skipped';
-          result.reason = `CI checks failed after rebase: ${formatFailedChecks(checksStatus)}`;
+          result.reason = `CI checks failed: ${formatFailedChecks(checksStatus)}`;
           return result;
         }
       }
-    }
 
-    // Step 6: Final check before merge - PR might be behind after previous merges
-    ui.updateStatus('Final merge check...');
-    freshPR = await getPullRequest(client, owner, repo, pr.number);
+      // Step 4: Check approval status
+      ui.updateStatus('Checking review status...');
+      const reviewInfo = await getReviewInfo(client, owner, repo, pr.number);
 
-    if (needsRebase(freshPR)) {
-      if (options.dryRun) {
-        ui.updateStatus('[DRY-RUN] Would trigger rebase (PR is behind)...');
-      } else {
-        ui.updateStatus('PR is behind, triggering rebase...');
-        const previousSha = freshPR.head.sha;
-        const method = await triggerRebase(client, owner, repo, freshPR);
-        ui.updateStatus(`Rebase triggered via ${method}, waiting...`);
-
-        await poll<{ hasNewCommit: boolean; currentSha: string }>(
-          () => hasNewCommitSince(client, owner, repo, pr.number, previousSha),
-          {
-            ...createRebasePollerOptions(
-              (pollResult) => (pollResult.hasNewCommit ? 'done' : 'continue'),
-              (_, elapsed) => {
-                ui.updateStatus(`Waiting for rebase (${formatDuration(elapsed)})`);
-              }
-            ),
-            timeoutMs: options.rebaseTimeoutMs,
-          }
-        );
-
-        await sleep(3000);
-        freshPR = await getPullRequest(client, owner, repo, pr.number);
-
-        ui.updateStatus('Waiting for CI after rebase...');
-        checksStatus = await poll<ChecksStatus>(
-          () => getChecksStatus(client, owner, repo, freshPR.head.sha),
-          {
-            ...createCICheckPollerOptions(
-              (status) => {
-                if (areChecksFailing(status)) return 'done';
-                if (areChecksPassing(status)) return 'done';
-                return 'continue';
-              },
-              (status, elapsed) => {
-                ui.updateStatus(
-                  `Waiting for CI after rebase: ${status.successful}/${status.total} passed (${formatDuration(elapsed)})`
-                );
-              }
-            ),
-            timeoutMs: options.checkTimeoutMs,
-          }
-        );
-
-        if (areChecksFailing(checksStatus)) {
-          result.status = 'skipped';
-          result.reason = `CI checks failed after rebase: ${formatFailedChecks(checksStatus)}`;
-          return result;
+      if (!reviewInfo.hasApproval) {
+        if (options.dryRun) {
+          ui.updateStatus('[DRY-RUN] Would approve PR...');
+        } else {
+          ui.updateStatus('Approving PR...');
+          await approvePullRequest(client, owner, repo, pr.number);
         }
       }
-    }
 
-    // Step 7: Merge with retry logic for late-starting checks
-    if (options.dryRun) {
-      ui.updateStatus('[DRY-RUN] Would merge PR...');
-    } else {
+      // Step 5: Handle rebase if needed
+      freshPR = await getPullRequest(client, owner, repo, pr.number);
+
+      if (needsRebase(freshPR)) {
+        if (options.dryRun) {
+          ui.updateStatus('[DRY-RUN] Would trigger rebase...');
+        } else {
+          ui.updateStatus('Triggering rebase...');
+          const previousSha = freshPR.head.sha;
+          const method = await triggerRebase(client, owner, repo, freshPR);
+          ui.updateStatus(`Rebase triggered via ${method}, waiting...`);
+
+          // Wait for Renovate to push a new commit
+          await poll<{ hasNewCommit: boolean; currentSha: string }>(
+            () => hasNewCommitSince(client, owner, repo, pr.number, previousSha),
+            {
+              ...createRebasePollerOptions(
+                (pollResult) => (pollResult.hasNewCommit ? 'done' : 'continue'),
+                (_, elapsed) => {
+                  ui.updateStatus(`Waiting for rebase (${formatDuration(elapsed)})`);
+                }
+              ),
+              timeoutMs: options.rebaseTimeoutMs,
+            }
+          );
+
+          await sleep(3000);
+          freshPR = await getPullRequest(client, owner, repo, pr.number);
+
+          // Wait for CI checks on the new commit
+          const checkResult = await waitForChecks(
+            client, owner, repo, freshPR.head.sha, ui, options.checkTimeoutMs, 'Waiting for CI after rebase'
+          );
+          checksStatus = checkResult.status;
+
+          if (!checkResult.passed) {
+            result.status = 'skipped';
+            result.reason = `CI checks failed after rebase: ${formatFailedChecks(checksStatus)}`;
+            return result;
+          }
+        }
+      }
+
+      // Step 6: Final check before merge - PR might be behind after previous merges
+      ui.updateStatus('Final merge check...');
+      freshPR = await getPullRequest(client, owner, repo, pr.number);
+
+      if (needsRebase(freshPR)) {
+        if (options.dryRun) {
+          ui.updateStatus('[DRY-RUN] Would trigger rebase (PR is behind)...');
+        } else {
+          ui.updateStatus('PR is behind, triggering rebase...');
+          const previousSha = freshPR.head.sha;
+          const method = await triggerRebase(client, owner, repo, freshPR);
+          ui.updateStatus(`Rebase triggered via ${method}, waiting...`);
+
+          await poll<{ hasNewCommit: boolean; currentSha: string }>(
+            () => hasNewCommitSince(client, owner, repo, pr.number, previousSha),
+            {
+              ...createRebasePollerOptions(
+                (pollResult) => (pollResult.hasNewCommit ? 'done' : 'continue'),
+                (_, elapsed) => {
+                  ui.updateStatus(`Waiting for rebase (${formatDuration(elapsed)})`);
+                }
+              ),
+              timeoutMs: options.rebaseTimeoutMs,
+            }
+          );
+
+          await sleep(3000);
+          freshPR = await getPullRequest(client, owner, repo, pr.number);
+
+          const checkResult = await waitForChecks(
+            client, owner, repo, freshPR.head.sha, ui, options.checkTimeoutMs, 'Waiting for CI after rebase'
+          );
+          checksStatus = checkResult.status;
+
+          if (!checkResult.passed) {
+            result.status = 'skipped';
+            result.reason = `CI checks failed after rebase: ${formatFailedChecks(checksStatus)}`;
+            return result;
+          }
+        }
+      }
+
+      // Step 7: Merge with retry logic for late-starting checks
+      if (options.dryRun) {
+        ui.updateStatus('[DRY-RUN] Would merge PR...');
+        result.status = 'merged';
+        return result;
+      }
+
+      // Merge attempt loop (for late-starting checks)
       const maxMergeRetries = 3;
-      let mergeAttempt = 0;
-
-      while (mergeAttempt < maxMergeRetries) {
-        mergeAttempt++;
+      for (let mergeAttempt = 1; mergeAttempt <= maxMergeRetries; mergeAttempt++) {
         ui.updateStatus(mergeAttempt > 1 ? `Merging (attempt ${mergeAttempt})...` : 'Merging...');
 
         try {
           await mergePullRequest(client, owner, repo, pr.number, {
             mergeMethod: options.mergeMethod,
           });
-          break; // Success!
+          result.status = 'merged';
+          return result;
         } catch (mergeError) {
-          if (mergeError instanceof MergeBlockedError && mergeAttempt < maxMergeRetries) {
-            // Merge failed - might be due to late-starting checks
-            ui.updateStatus('Merge blocked, checking for pending checks...');
+          if (mergeError instanceof MergeBlockedError) {
+            ui.updateStatus('Merge blocked, re-evaluating PR state...');
 
-            // Re-fetch PR data and check status
+            // Re-fetch everything and check what's wrong
             freshPR = await getPullRequest(client, owner, repo, pr.number);
-            checksStatus = await getChecksStatus(client, owner, repo, freshPR.head.sha);
 
-            if (areChecksPending(checksStatus)) {
-              // There are pending checks - wait for them
-              ui.updateStatus('New checks detected, waiting...');
-
-              checksStatus = await poll<ChecksStatus>(
-                () => getChecksStatus(client, owner, repo, freshPR.head.sha),
-                {
-                  ...createCICheckPollerOptions(
-                    (status) => {
-                      if (areChecksFailing(status)) return 'done';
-                      if (areChecksPassing(status)) return 'done';
-                      return 'continue';
-                    },
-                    (status, elapsed) => {
-                      ui.updateStatus(
-                        `Waiting for late checks: ${status.successful}/${status.total} passed (${formatDuration(elapsed)})`
-                      );
-                    }
-                  ),
-                  timeoutMs: options.checkTimeoutMs,
-                }
-              );
-
-              if (areChecksFailing(checksStatus)) {
-                result.status = 'skipped';
-                result.reason = `CI checks failed: ${formatFailedChecks(checksStatus)}`;
-                return result;
-              }
-
-              // Checks passed, loop will retry merge
-              continue;
+            // Check if PR was merged/closed in the meantime
+            if (freshPR.merged) {
+              result.status = 'merged';
+              result.reason = 'PR was already merged';
+              return result;
+            }
+            if (freshPR.state === 'closed') {
+              result.status = 'skipped';
+              result.reason = 'PR was closed';
+              return result;
             }
 
-            // No pending checks but merge still blocked - give up
+            checksStatus = await getChecksStatus(client, owner, repo, freshPR.head.sha);
+
+            // If stability-days appeared, skip
+            if (hasStabilityDaysPending(checksStatus)) {
+              result.status = 'skipped';
+              result.reason = 'Waiting for stability-days (skipped)';
+              return result;
+            }
+
+            // Check for new pending checks
+            if (areChecksPending(checksStatus)) {
+              ui.updateStatus('New checks detected, waiting...');
+              const checkResult = await waitForChecks(
+                client, owner, repo, freshPR.head.sha, ui, options.checkTimeoutMs, 'Waiting for late checks'
+              );
+
+              if (!checkResult.passed) {
+                result.status = 'skipped';
+                result.reason = `CI checks failed: ${formatFailedChecks(checkResult.status)}`;
+                return result;
+              }
+              continue; // Retry merge
+            }
+
+            // Check if PR needs rebase now
+            if (needsRebase(freshPR)) {
+              // Throw to trigger outer retry loop - start from beginning
+              throw new Error('PR needs rebase after merge attempt');
+            }
+
+            // Last merge attempt failed with no clear reason
+            if (mergeAttempt >= maxMergeRetries) {
+              throw mergeError;
+            }
+          } else {
             throw mergeError;
           }
-          // Non-recoverable error or max retries reached
-          throw mergeError;
         }
       }
-    }
+    } catch (error) {
+      // Check if this is a retriable error
+      const isRetriable =
+        error instanceof MergeBlockedError ||
+        (error instanceof Error && error.message.includes('needs rebase'));
 
-    result.status = 'merged';
-    return result;
-  } catch (error) {
-    result.status = 'failed';
-    if (isGhRenovateError(error)) {
-      result.reason = error.userMessage;
-    } else if (error instanceof Error) {
-      result.reason = error.message;
-    } else {
-      result.reason = 'Unknown error';
+      if (isRetriable && attempt < MAX_PROCESS_RETRIES) {
+        ui.updateStatus(`Error occurred, will retry: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        continue; // Retry from the beginning
+      }
+
+      // Non-retriable or max retries reached
+      result.status = 'failed';
+      if (isGhRenovateError(error)) {
+        result.reason = error.userMessage;
+      } else if (error instanceof Error) {
+        result.reason = error.message;
+      } else {
+        result.reason = 'Unknown error';
+      }
+      return result;
     }
-    return result;
   }
+
+  return result;
 }
 
 /**

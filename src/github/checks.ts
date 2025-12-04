@@ -148,3 +148,64 @@ export function areChecksPending(status: ChecksStatus): boolean {
 export function areChecksFailing(status: ChecksStatus): boolean {
   return status.state === 'failure' || status.state === 'error';
 }
+
+/**
+ * Checks that should be ignored when determining if PR is ready
+ * These checks can be pending indefinitely (e.g., stability-days)
+ */
+const IGNORED_PENDING_CHECKS = [
+  'renovate/stability-days',
+];
+
+/**
+ * Check if the only pending checks are ones we should ignore
+ * Returns true if PR is blocked by non-ignorable pending checks
+ */
+export function hasBlockingPendingChecks(status: ChecksStatus): boolean {
+  const pendingChecks = status.details.filter(
+    (d) => d.status !== 'completed'
+  );
+
+  // If no pending checks, not blocked
+  if (pendingChecks.length === 0) {
+    return false;
+  }
+
+  // Check if ALL pending checks are ignorable
+  const allIgnorable = pendingChecks.every((check) =>
+    IGNORED_PENDING_CHECKS.some((ignored) =>
+      check.name.toLowerCase().includes(ignored.toLowerCase())
+    )
+  );
+
+  // Blocked if NOT all are ignorable
+  return !allIgnorable;
+}
+
+/**
+ * Check if PR has a stability-days check that is pending
+ */
+export function hasStabilityDaysPending(status: ChecksStatus): boolean {
+  return status.details.some(
+    (d) =>
+      d.name.toLowerCase().includes('stability-days') &&
+      d.status !== 'completed'
+  );
+}
+
+/**
+ * Get checks status excluding ignored checks from pending count
+ */
+export function getEffectiveChecksState(status: ChecksStatus): 'success' | 'pending' | 'failure' | 'error' {
+  if (status.failed > 0) {
+    return 'failure';
+  }
+
+  // Check if there are non-ignorable pending checks
+  if (hasBlockingPendingChecks(status)) {
+    return 'pending';
+  }
+
+  // All checks passed or only ignorable ones are pending
+  return 'success';
+}
