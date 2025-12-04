@@ -1,6 +1,6 @@
 {
   "name": "gh-renovate",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Interactive CLI to batch-merge Renovate PRs",
   "license": "MIT",
   "author": "Christian Schuhbaum",

@@ -326,10 +326,9 @@ async function processSinglePR(
               throw new Error('PR needs rebase after merge attempt');
             }
 
-            // Last merge attempt failed with no clear reason
-            if (mergeAttempt >= maxMergeRetries) {
-              throw mergeError;
-            }
+            // No pending checks, no rebase needed - something else is blocking
+            // Don't retry, just throw immediately
+            throw mergeError;
           } else {
             throw mergeError;
           }

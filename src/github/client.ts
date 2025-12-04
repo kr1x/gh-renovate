@@ -59,7 +59,11 @@ export function createGitHubClient(options: ClientOptions): GitHubClient {
     },
 
     retry: {
-      doNotRetry: ['429'], // Handled by throttling plugin
+      doNotRetry: [
+        '429', // Handled by throttling plugin
+        '405', // Method not allowed - merge blocked, not transient
+        '422', // Validation failed - not transient
+      ],
       retries: 3,
     },
 
